@@ -144,8 +144,24 @@ constexpr f32 kFollowDistance = kIdleDistance + 200.0f;  // 420.0f
 constexpr f32 kRunDistance = kFollowDistance + 400.0f;  // 820.0f
 
 constexpr f32 kWalkSpeed = 12.0f;
-constexpr f32 kRunSpeed = 20.0f;
+// Her run animation's playback rate is driven entirely by the engine's
+// internal, protected per-actor animation state (mAnm_p), which these NPC
+// classes don't expose any public setter/getter for - unlike a few other
+// actor types in the engine (e.g. the fairy/mirror NPCs), so we have no way
+// to speed the animation itself up to visually match a faster run speed
+// without touching Dusklight's own source. 15.0f mirrors her native
+// escape()'s sprint speed (her fastest officially-authored movement for
+// this same run animation), keeping her movement visually in sync with the
+// animation instead of "ice-skating" at a higher raw speed.
+constexpr f32 kRunSpeed = 15.0f;
 constexpr s16 kTurnRate = 0x800;
+
+// See the manual ground-snap in follow_tick_impl: how far ahead of her (in
+// her direction of travel) and how high above her the ground-height probe
+// point is sampled, and the maximum she's allowed to rise in a single tick.
+constexpr f32 kGroundProbeAheadDist = 40.0f;
+constexpr f32 kGroundProbeHeight = 250.0f;
+constexpr f32 kMaxStepUpPerTick = 80.0f;
 
 // Whether the follower is currently walking/running to close the gap, vs.
 // idling at kIdleDistance. See the hysteresis comment on kFollowDistance.
@@ -218,16 +234,35 @@ static void follow_tick_impl(T* self, const FollowMotionSet& motions) {
 
     // daNpcF_c::execute()'s own per-frame ground-collision pass (which runs
     // right after main() returns) doesn't reliably keep her glued to terrain
-    // across larger single-frame elevation changes - e.g. she'll stall at
-    // the top of a staircase, still closing in horizontally while floating
-    // at the old height. Independently re-query the ground height directly
-    // beneath her every tick, the same way other moving actors (e.g. the
+    // across larger single-frame elevation changes - e.g. jagged/stepped
+    // stairs rather than a smooth ramp. Independently re-query the ground
+    // height every tick, the same way other moving actors (e.g. the
     // wall-climber in d_a_obj_cwall.cpp) do it, and snap to it ourselves
-    // rather than relying solely on that pass.
+    // rather than relying solely on that pass. The query point is sampled
+    // slightly ahead of her along her direction of travel (not directly
+    // beneath her already-lagging current position) and from well above her,
+    // so the downward sweep can find the tread at the top of a tall/jagged
+    // riser when climbing stairs, not just a continuous slope.
+    cXyz toPlayerXZ = player->current.pos - self->current.pos;
+    toPlayerXZ.y = 0.0f;
+    const f32 toPlayerDist = toPlayerXZ.absXZ();
+
     cXyz groundQuery = self->current.pos;
-    groundQuery.y += 100.0f;
+    if (toPlayerDist > 1.0f) {
+        groundQuery.x += (toPlayerXZ.x / toPlayerDist) * kGroundProbeAheadDist;
+        groundQuery.z += (toPlayerXZ.z / toPlayerDist) * kGroundProbeAheadDist;
+    }
+    groundQuery.y += kGroundProbeHeight;
+
     if (fopAcM_gc_c::gndCheck(&groundQuery)) {
-        self->current.pos.y = fopAcM_gc_c::getGroundY();
+        // Climbing is clamped to a reasonable per-tick step height so she
+        // doesn't snap straight up a wall/cliff she isn't meant to scale -
+        // she'll instead climb a tall staircase over a couple of ticks,
+        // which still reads as smooth at 60fps. Descending is left
+        // unclamped, since drops already track correctly.
+        const f32 groundY = fopAcM_gc_c::getGroundY();
+        const f32 maxRise = self->current.pos.y + kMaxStepUpPerTick;
+        self->current.pos.y = groundY < maxRise ? groundY : maxRise;
     }
 
     const f32 dist = fopAcM_searchActorDistanceXZ(self, player);
