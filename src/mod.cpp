@@ -3,6 +3,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
+#include "mods/svc/ui.h"
 
 // Game includes
 #include "d/actor/d_a_npc_kasi_hana.h"
@@ -21,6 +22,7 @@ IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(ActorService, svc_actor);
 IMPORT_SERVICE(ConfigService, svc_config);
+IMPORT_SERVICE(UiService, svc_ui);
 
 // Example game hook: turn heart drops into green rupees.
 DEFINE_HOOK(fopAcM_createItem, CreateItem);
@@ -57,12 +59,26 @@ static FollowerChoice g_selectedFollower = FollowerChoice::Kili;
 
 static bool g_following = false;
 static ActorId g_followerId = 0;
+static ConfigVarHandle g_followerChoiceVar = 0;
 
 // Frames to wait between respawn attempts once the follower is missing, so a
 // persistently failing spawn (e.g. missing resources) doesn't spam the actor
 // service every tick.
 constexpr int kRespawnCooldownFrames = 30;
 static int g_respawnCooldown = 0;
+
+// The engine's stage-load sequence updates the start-stage name/room very
+// early (well before the destination room's actor heap is actually ready),
+// and mod_update() keeps ticking across that whole multi-frame sequence.
+// Spawning into a room that isn't fully set up yet was corrupting engine
+// state badly enough to unload other NPCs/the player and eventually crash.
+// To avoid racing that setup, we require the player's (stage, room) pair to
+// stay unchanged for kStageSettleFrames consecutive ticks before a respawn
+// is allowed, which only happens once gameplay has actually resumed.
+constexpr int kStageSettleFrames = 30;
+static char g_lastStageName[8] = {};
+static int8_t g_lastRoomNo = -1;
+static int g_stageStableFrames = 0;
 
 constexpr f32 kFollowDistance = 220.0f;  // Stand still once this close to the player.
 constexpr f32 kRunDistance = 550.0f;     // Sprint to catch up once this far behind.
@@ -102,14 +118,15 @@ constexpr FollowMotionSet kKyuMotions{8, 6, 11};   // MOT_W_RUN_A, MOT_W_WALK_A,
 constexpr FollowMotionSet kHanaMotions{9, 7, 11};  // MOT_W_RUN_A, MOT_W_WALK_A, MOT_W_WAIT_A_LOOP
 constexpr FollowMotionSet kMichMotions{8, 6, 4};   // MOT_W_RUN_A, MOT_W_WALK_A, MOT_W_WAIT_A
 
-static FollowerChoice parse_follower_choice(const char* value) {
-    if (value != nullptr) {
-        if (!strcmp(value, "hana") || !strcmp(value, "hanna")) {
-            return FollowerChoice::Hana;
-        }
-        if (!strcmp(value, "mich") || !strcmp(value, "misha")) {
-            return FollowerChoice::Misha;
-        }
+// UI_CONTROL_SELECT options for the "Follower" toggle, in FollowerChoice order.
+static const char* const kFollowerChoiceOptions[3] = {"Kili", "Hanna", "Misha"};
+
+static FollowerChoice parse_follower_choice(int64_t value) {
+    if (value == static_cast<int64_t>(FollowerChoice::Hana)) {
+        return FollowerChoice::Hana;
+    }
+    if (value == static_cast<int64_t>(FollowerChoice::Misha)) {
+        return FollowerChoice::Misha;
     }
     return FollowerChoice::Kili;
 }
@@ -261,8 +278,24 @@ static void respawn_follower_at_player() {
 
 static void on_follower_choice_changed(
     ModContext*, ConfigVarHandle, const ConfigVarValue* value, const ConfigVarValue*, void*) {
-    g_selectedFollower = parse_follower_choice(value->string_value);
+    g_selectedFollower = parse_follower_choice(value->int_value);
     mods::log::info("Follower choice set to {}", follower_choice_name(g_selectedFollower));
+}
+
+// Builds the mod's panel in the host's Mods window: a single dropdown to pick
+// which STAR-tent NPC follows the player. Bound directly to the
+// "followerChoice" config var so the UI, config.json, and --cvar overrides
+// all stay in sync automatically.
+static ModResult build_mods_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = "Follower";
+    control.help_rml = "Which STAR-tent NPC follows the player after the group is talked to.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_followerChoiceVar;
+    control.options = kFollowerChoiceOptions;
+    control.option_count = 3;
+    return svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
 }
 
 extern "C" {
@@ -307,38 +340,72 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     }
 
     // "followerChoice" selects which STAR-tent NPC becomes the permanent
-    // follower: "kili" (default), "hanna", or "misha". Edit this in the
-    // mod's config.json (or pass --cvar) before talking to the group.
+    // follower: Kili (default, 0), Hanna (1), or Misha (2). Stored as an int
+    // so it can be bound directly to a UI_CONTROL_SELECT dropdown below.
     ConfigVarDesc desc = CONFIG_VAR_DESC_INIT;
     desc.name = "followerChoice";
-    desc.type = CONFIG_VAR_STRING;
-    desc.default_string = "kili";
-    ConfigVarHandle followerVar = 0;
-    result = svc_config->register_var(mod_ctx, &desc, &followerVar);
+    desc.type = CONFIG_VAR_INT;
+    desc.default_int = static_cast<int64_t>(FollowerChoice::Kili);
+    result = svc_config->register_var(mod_ctx, &desc, &g_followerChoiceVar);
     if (result != MOD_OK) {
         mods::log::error("failed to register followerChoice config var");
         return result;
     }
 
-    char buffer[16] = {};
-    size_t length = 0;
-    if (svc_config->get_string(mod_ctx, followerVar, buffer, sizeof(buffer), &length) == MOD_OK) {
-        g_selectedFollower = parse_follower_choice(buffer);
+    int64_t value = 0;
+    if (svc_config->get_int(mod_ctx, g_followerChoiceVar, &value) == MOD_OK) {
+        g_selectedFollower = parse_follower_choice(value);
     }
-    svc_config->subscribe(mod_ctx, followerVar, on_follower_choice_changed, nullptr, nullptr);
+    svc_config->subscribe(mod_ctx, g_followerChoiceVar, on_follower_choice_changed, nullptr, nullptr);
+
+    // Surfaces the "followerChoice" var as a dropdown in the mod's tab of the
+    // host Mods window, since registering a config var alone doesn't produce
+    // any visible UI control.
+    UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
+    panelDesc.build = build_mods_panel;
+    result = svc_ui->register_mods_panel(mod_ctx, &panelDesc);
+    if (result != MOD_OK) {
+        mods::log::error("failed to register mods panel");
+        return result;
+    }
 
     mods::log::info("my_mod initialized (follower choice: {})", follower_choice_name(g_selectedFollower));
     return MOD_OK;
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    // Track how long the player's current (stage, room) pair has been
+    // stable. Used to withhold respawns until a stage/room transition has
+    // actually finished settling (see kStageSettleFrames above).
+    fopAc_ac_c* player = dComIfGp_getPlayer(0);
+    if (player != nullptr) {
+        const char* stageName = dComIfGp_getStartStageName();
+        const int8_t roomNo = fopAcM_GetRoomNo(player);
+        if (std::strncmp(stageName, g_lastStageName, sizeof(g_lastStageName)) != 0 ||
+            roomNo != g_lastRoomNo)
+        {
+            std::strncpy(g_lastStageName, stageName, sizeof(g_lastStageName) - 1);
+            g_lastRoomNo = roomNo;
+            g_stageStableFrames = 0;
+        } else if (g_stageStableFrames < kStageSettleFrames) {
+            ++g_stageStableFrames;
+        }
+    } else {
+        g_stageStableFrames = 0;
+    }
+
     if (g_following) {
         const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
         fopAc_ac_c* existing = fopAcM_SearchByID(g_followerId);
         const bool stillAlive = existing != nullptr && fopAcM_GetName(existing) == traits.nameEnum;
 
         if (!stillAlive) {
-            if (g_respawnCooldown > 0) {
+            const bool safeToRespawn = player != nullptr && g_stageStableFrames >= kStageSettleFrames;
+            if (!safeToRespawn) {
+                // Stage/room is still settling (or the player hasn't
+                // reappeared yet); keep waiting instead of risking a spawn
+                // into a not-yet-ready actor heap.
+            } else if (g_respawnCooldown > 0) {
                 --g_respawnCooldown;
             } else {
                 respawn_follower_at_player();
