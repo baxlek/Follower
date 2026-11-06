@@ -118,7 +118,7 @@ constexpr FollowMotionSet kKyuMotions{8, 6, 11};   // MOT_W_RUN_A, MOT_W_WALK_A,
 constexpr FollowMotionSet kHanaMotions{9, 7, 11};  // MOT_W_RUN_A, MOT_W_WALK_A, MOT_W_WAIT_A_LOOP
 constexpr FollowMotionSet kMichMotions{8, 6, 4};   // MOT_W_RUN_A, MOT_W_WALK_A, MOT_W_WAIT_A
 
-// UI_CONTROL_SELECT options for the "Follower" toggle, in FollowerChoice order.
+// UI_CONTROL_DROPDOWN options for the "Follower" toggle, in FollowerChoice order.
 static const char* const kFollowerChoiceOptions[3] = {"Kili", "Hanna", "Misha"};
 
 static FollowerChoice parse_follower_choice(int64_t value) {
@@ -286,11 +286,16 @@ static void on_follower_choice_changed(
 // which STAR-tent NPC follows the player. Bound directly to the
 // "followerChoice" config var so the UI, config.json, and --cvar overrides
 // all stay in sync automatically.
+//
+// UI_CONTROL_SELECT needs a help pane (mod window tabs only) and fails with
+// MOD_UNSUPPORTED on a plain Mods-window panel, so UI_CONTROL_DROPDOWN is
+// used instead; it binds to the same int config var/option-index scheme and
+// has no help-pane requirement.
 static ModResult build_mods_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     UiControlDesc control = UI_CONTROL_DESC_INIT;
-    control.kind = UI_CONTROL_SELECT;
+    control.kind = UI_CONTROL_DROPDOWN;
     control.label = "Follower";
-    control.help_rml = "Which STAR-tent NPC follows the player after the group is talked to.";
+    control.tooltip = "Which STAR-tent NPC follows the player after the group is talked to.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_followerChoiceVar;
     control.options = kFollowerChoiceOptions;
