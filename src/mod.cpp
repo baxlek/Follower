@@ -124,11 +124,32 @@ static char g_lastStageName[8] = {};
 static int8_t g_lastRoomNo = -1;
 static int g_stageStableFrames = 0;
 
-constexpr f32 kFollowDistance = 220.0f;  // Stand still once this close to the player.
-constexpr f32 kRunDistance = 550.0f;     // Sprint to catch up once this far behind.
-constexpr f32 kWalkSpeed = 7.0f;
-constexpr f32 kRunSpeed = 16.0f;
+// Distance at which she's close enough to stop and idle - this matches the
+// distance she's always naturally settled to once the player also stops
+// moving.
+constexpr f32 kIdleDistance = 220.0f;
+
+// Target "following" gap: a bit further than the idle distance (per
+// request, +200 units) so that once she starts moving to catch up she keeps
+// going until she's back within this range, instead of closing all the way
+// up to the player's heels. Combined with the hysteresis below (she only
+// *starts* moving again once past this distance, and only *stops* once back
+// within kIdleDistance), this keeps her trailing distance steady/consistent
+// rather than jerky stop-and-go right at a single exact boundary.
+constexpr f32 kFollowDistance = kIdleDistance + 200.0f;  // 420.0f
+
+// Beyond this distance (e.g. she just got left behind after a loading zone,
+// or the player sprints off) she breaks into a full run to catch back up
+// quickly instead of ambling along at walk speed indefinitely.
+constexpr f32 kRunDistance = kFollowDistance + 400.0f;  // 820.0f
+
+constexpr f32 kWalkSpeed = 12.0f;
+constexpr f32 kRunSpeed = 20.0f;
 constexpr s16 kTurnRate = 0x800;
+
+// Whether the follower is currently walking/running to close the gap, vs.
+// idling at kIdleDistance. See the hysteresis comment on kFollowDistance.
+static bool g_followerMoving = false;
 
 // dSv_event_flag_c::F_290 - Castle Town - Star Game 1 cleared
 constexpr u32 kStarGameClearedFlag = 290;
@@ -195,16 +216,47 @@ static void follow_tick_impl(T* self, const FollowMotionSet& motions) {
 
     self->_turn_pos(player->current.pos, kTurnRate);
 
+    // daNpcF_c::execute()'s own per-frame ground-collision pass (which runs
+    // right after main() returns) doesn't reliably keep her glued to terrain
+    // across larger single-frame elevation changes - e.g. she'll stall at
+    // the top of a staircase, still closing in horizontally while floating
+    // at the old height. Independently re-query the ground height directly
+    // beneath her every tick, the same way other moving actors (e.g. the
+    // wall-climber in d_a_obj_cwall.cpp) do it, and snap to it ourselves
+    // rather than relying solely on that pass.
+    cXyz groundQuery = self->current.pos;
+    groundQuery.y += 100.0f;
+    if (fopAcM_gc_c::gndCheck(&groundQuery)) {
+        self->current.pos.y = fopAcM_gc_c::getGroundY();
+    }
+
     const f32 dist = fopAcM_searchActorDistanceXZ(self, player);
-    if (dist > kRunDistance) {
-        self->setMotion(motions.run, -1.0f, 0);
-        fopAcM_SetSpeedF(self, kRunSpeed);
-    } else if (dist > kFollowDistance) {
-        self->setMotion(motions.walk, -1.0f, 0);
-        fopAcM_SetSpeedF(self, kWalkSpeed);
-    } else {
+
+    // Hysteresis: only start moving once she's past the follow distance, and
+    // only stop again once she's back within the idle distance. A single
+    // shared threshold would make her flicker between idle/walk right at the
+    // boundary; this instead keeps her trailing distance steady.
+    if (!g_followerMoving && dist > kFollowDistance) {
+        g_followerMoving = true;
+    } else if (g_followerMoving && dist <= kIdleDistance) {
+        g_followerMoving = false;
+    }
+
+    if (!g_followerMoving) {
         self->setMotion(motions.idle, -1.0f, 0);
         fopAcM_SetSpeedF(self, 0.0f);
+    } else if (dist > kRunDistance) {
+        self->setMotion(motions.run, -1.0f, 0);
+        fopAcM_SetSpeedF(self, kRunSpeed);
+    } else {
+        // Scale smoothly between walk and run speed across the remaining
+        // catch-up range so closing the gap feels proportional rather than
+        // an abrupt speed snap.
+        f32 t = (dist - kIdleDistance) / (kRunDistance - kIdleDistance);
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        const f32 speed = kWalkSpeed + (kRunSpeed - kWalkSpeed) * t;
+        self->setMotion(speed > 0.5f * (kWalkSpeed + kRunSpeed) ? motions.run : motions.walk, -1.0f, 0);
+        fopAcM_SetSpeedF(self, speed);
     }
 
     self->playMotion();
@@ -235,6 +287,7 @@ static HookAction on_kasi_main_pre(
         g_followerId = selfId;
         g_missingFrames = 0;
         g_respawnCooldown = 0;
+        g_followerMoving = false;  // She's teleported right onto the player below - start idle.
 
         fopAc_ac_c* player = dComIfGp_getPlayer(0);
         if (player != nullptr) {
