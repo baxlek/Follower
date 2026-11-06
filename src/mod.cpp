@@ -3,6 +3,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
+#include "mods/svc/stage.h"
 #include "mods/svc/ui.h"
 
 // Game includes
@@ -11,6 +12,7 @@
 #include "d/actor/d_a_npc_kasi_mich.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
+#include "d/d_stage.h"
 #include "f_op/f_op_actor_mng.h"
 #include "f_pc/f_pc_name.h"
 
@@ -22,6 +24,7 @@ IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(ActorService, svc_actor);
 IMPORT_SERVICE(ConfigService, svc_config);
+IMPORT_SERVICE(StageService, svc_stage);
 IMPORT_SERVICE(UiService, svc_ui);
 
 // Example game hook: turn heart drops into green rupees.
@@ -45,10 +48,22 @@ static HookAction on_create_item_pre(ModContext*, void* args, void*, void*) {
 // again, group leader Hanna signals all three NPCs to run away (via each
 // NPC's own escape() method). A mod config option ("followerChoice") picks
 // one of the three; when she's signaled to flee we cancel it, flag her as a
-// permanent follower, and take over her per-tick behavior instead. She keeps
-// following across loading zones and other room/area transitions by being
-// respawned at the player's current position whenever her actor disappears
-// (the game frees NPCs that belong to rooms/stages the player has left).
+// permanent follower, and take over her per-tick behavior instead.
+//
+// To keep following across loading zones/room transitions, we watch for a
+// pending stage change (dComIfGp_isEnableNextStage(), set the instant the
+// player triggers a loading zone or door - the same path full stage changes
+// and plain room-to-room moves both go through) and use StageService to
+// pre-register her as a normal static actor entry in the *destination*
+// stage/room, before it ever loads. That means the engine's own room-load
+// pipeline creates her exactly like any authored NPC, respecting its usual
+// actor/heap/resource budget, instead of racing that pipeline with an ad-hoc
+// runtime creation call - the latter was corrupting engine state badly
+// enough to unload other NPCs/the player and crash. A hooked main() adopts
+// whichever freshly-created instance shows up next and snaps her next to the
+// player instantly. A runtime create_actor_from_name respawn is kept only as
+// a last-resort fallback, for the rare case a transition isn't caught this
+// way.
 // ---------------------------------------------------------------------------
 
 enum class FollowerChoice : int { Kili = 0, Hana = 1, Misha = 2 };
@@ -57,13 +72,41 @@ enum class FollowerChoice : int { Kili = 0, Hana = 1, Misha = 2 };
 // the three NPCs can be the active follower; the other two flee normally.
 static FollowerChoice g_selectedFollower = FollowerChoice::Kili;
 
+// 0 means "no live instance currently tracked". Cleared whenever the tracked
+// actor disappears, and (re)latched either by escape() the first time she
+// starts following, or by main() adopting whichever matching NPC instance
+// the engine's own stage/room load creates next.
 static bool g_following = false;
 static ActorId g_followerId = 0;
 static ConfigVarHandle g_followerChoiceVar = 0;
 
-// Frames to wait between respawn attempts once the follower is missing, so a
-// persistently failing spawn (e.g. missing resources) doesn't spam the actor
-// service every tick.
+// Her creation `parameters`, captured from the live actor the moment she
+// starts following and reused for every future StageService::add_actor
+// registration, so a freshly (re)created instance keeps the same identity/
+// behavior flags as her original authored placement.
+static u32 g_followerSpawnParam = 0;
+
+// Tracks the single StageService edit (if any) currently registering the
+// follower into an upcoming destination stage/room. add_actor edits persist
+// for the whole life of the mod, so we must retract the previous one before
+// registering a new destination, or she'd end up duplicated/stuck in stale
+// rooms.
+static StageActorHandle g_stageEditHandle = 0;
+static char g_stageEditStage[8] = {};
+static s16 g_stageEditRoom = -1;
+
+// How long (in ticks) the follower has been missing with no live instance
+// adopted yet. The normal path (StageService pre-registration + main()
+// adoption) should resolve this almost immediately once the destination room
+// loads; the runtime create_actor_from_name fallback below only kicks in
+// after a long delay, as a last resort for transitions we didn't catch (e.g.
+// a teleport that never sets isEnableNextStage()).
+static int g_missingFrames = 0;
+constexpr int kFallbackRespawnDelayFrames = 150;  // ~2.5s at 60fps.
+
+// Frames to wait between fallback respawn attempts once the follower is
+// missing, so a persistently failing spawn (e.g. missing resources) doesn't
+// spam the actor service every tick.
 constexpr int kRespawnCooldownFrames = 30;
 static int g_respawnCooldown = 0;
 
@@ -72,9 +115,10 @@ static int g_respawnCooldown = 0;
 // and mod_update() keeps ticking across that whole multi-frame sequence.
 // Spawning into a room that isn't fully set up yet was corrupting engine
 // state badly enough to unload other NPCs/the player and eventually crash.
-// To avoid racing that setup, we require the player's (stage, room) pair to
-// stay unchanged for kStageSettleFrames consecutive ticks before a respawn
-// is allowed, which only happens once gameplay has actually resumed.
+// To avoid racing that setup, the (rare) fallback path below requires the
+// player's (stage, room) pair to stay unchanged for kStageSettleFrames
+// consecutive ticks before attempting a respawn, which only happens once
+// gameplay has actually resumed.
 constexpr int kStageSettleFrames = 30;
 static char g_lastStageName[8] = {};
 static int8_t g_lastRoomNo = -1;
@@ -170,6 +214,13 @@ static void follow_tick_impl(T* self, const FollowMotionSet& motions) {
 // following NPC. daNpcF_c::execute() only performs position
 // integration/ground collision when main() returns TRUE, so we must force
 // that even though we skip the original body.
+//
+// When no live instance is currently tracked (g_followerId == 0 - she was
+// just (re)created by the normal room/stage actor-list pipeline after a
+// StageService pre-registration, or this is her very first tick ever),
+// whichever matching NPC's main() runs next is adopted as the follower and
+// snapped directly to the player's position/angle instead of gradually
+// catching up, satisfying "spawn at the same point as the player".
 template <class T>
 static HookAction on_kasi_main_pre(
     FollowerChoice choice, void* args, void* retval, const FollowMotionSet& motions) {
@@ -178,7 +229,23 @@ static HookAction on_kasi_main_pre(
     }
 
     T* self = mods::arg<T*>(args, 0);
-    if (fopAcM_GetID(self) != g_followerId) {
+    const ActorId selfId = fopAcM_GetID(self);
+
+    if (g_followerId == 0) {
+        g_followerId = selfId;
+        g_missingFrames = 0;
+        g_respawnCooldown = 0;
+
+        fopAc_ac_c* player = dComIfGp_getPlayer(0);
+        if (player != nullptr) {
+            self->current.pos = player->current.pos;
+            self->current.angle = player->current.angle;
+            self->current.roomNo = player->current.roomNo;
+            self->old.pos = player->current.pos;
+            self->old.angle = player->current.angle;
+        }
+        mods::log::info("{} rejoined the player", follower_choice_name(choice));
+    } else if (selfId != g_followerId) {
         return HOOK_CONTINUE;
     }
 
@@ -204,6 +271,8 @@ static HookAction on_kasi_escape_pre(FollowerChoice choice, void* args) {
     if (!g_following && daNpcF_chkEvtBit(kStarGameClearedFlag)) {
         g_following = true;
         g_followerId = fopAcM_GetID(self);
+        g_followerSpawnParam = fopAcM_GetParam(self);
+        g_missingFrames = 0;
         g_respawnCooldown = 0;
         mods::log::info("{} is now following the player", follower_choice_name(choice));
     }
@@ -247,9 +316,58 @@ static HookAction on_kasi_mich_escape_pre(ModContext*, void* args, void*, void*)
     return on_kasi_escape_pre<daNpcKasiMich_c>(FollowerChoice::Misha, args);
 }
 
-// Respawns the selected follower NPC at the player's current position/room.
-// Used whenever her actor has disappeared (a loading zone or room change
-// freed her) so she can keep following in the new area.
+// Pre-registers the selected follower NPC into the stage/room the player is
+// about to transition into, via StageService::add_actor, so the engine's own
+// room-load pipeline creates her exactly the same way it creates any
+// authored static NPC in that room - respecting its normal actor/heap/
+// resource budget, instead of racing it with an ad-hoc runtime creation
+// call. Retracts any previous registration first: add_actor edits persist
+// for the whole life of the mod, so leaving an old one in place would leave
+// a stale duplicate copy of her behind in the room she's leaving.
+static void update_follower_stage_registration(const char* stage, s16 room) {
+    if (stage == nullptr || stage[0] == '\0' || room < 0) {
+        return;
+    }
+    if (g_stageEditHandle != 0 && room == g_stageEditRoom &&
+        std::strncmp(stage, g_stageEditStage, sizeof(g_stageEditStage)) == 0) {
+        return;  // Already registered for this exact destination.
+    }
+
+    if (g_stageEditHandle != 0) {
+        svc_stage->remove_actor_edit(mod_ctx, g_stageEditHandle);
+        g_stageEditHandle = 0;
+    }
+
+    const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
+
+    stage_actor_data_class record{};
+    std::memset(record.name, 0, sizeof(record.name));
+    std::strncpy(record.name, traits.stageName, sizeof(record.name) - 1);
+    record.base.parameters = g_followerSpawnParam;
+    record.base.position = cXyz{0.0f, 0.0f, 0.0f};  // Corrected on her first main() tick.
+    record.base.angle = csXyz{0, 0, 0};
+    record.base.setID = 0xFFFF;  // No switch association (matches the engine's own convention).
+
+    StageActorHandle handle = 0;
+    const ModResult result = svc_stage->add_actor(
+        mod_ctx, stage, static_cast<uint8_t>(room), -1, &record, sizeof(record), &handle);
+    if (result == MOD_OK) {
+        g_stageEditHandle = handle;
+        std::strncpy(g_stageEditStage, stage, sizeof(g_stageEditStage) - 1);
+        g_stageEditRoom = room;
+    } else {
+        mods::log::error(
+            "failed to pre-register {} into stage {} room {}", follower_choice_name(g_selectedFollower), stage,
+            room);
+    }
+}
+
+// Last-resort fallback: respawns the selected follower NPC at the player's
+// current position/room via a direct runtime actor creation call. Only used
+// when she's been missing for a long time with no StageService-registered
+// instance having been adopted (e.g. a teleport that never set
+// isEnableNextStage()), since this path is what previously corrupted engine
+// state badly enough to unload other NPCs/the player and crash.
 static void respawn_follower_at_player() {
     fopAc_ac_c* player = dComIfGp_getPlayer(0);
     if (player == nullptr) {
@@ -259,7 +377,7 @@ static void respawn_follower_at_player() {
     const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
 
     ActorSpawnParams params = {
-        .parameters = 0,
+        .parameters = g_followerSpawnParam,
         .argument = 0,
         .room_num = fopAcM_GetRoomNo(player),
         .position = {player->current.pos.x, player->current.pos.y, player->current.pos.z},
@@ -379,10 +497,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
-    // Track how long the player's current (stage, room) pair has been
-    // stable. Used to withhold respawns until a stage/room transition has
-    // actually finished settling (see kStageSettleFrames above).
     fopAc_ac_c* player = dComIfGp_getPlayer(0);
+
+    // Track how long the player's current (stage, room) pair has been
+    // stable. Only used to withhold the rare runtime fallback respawn below
+    // until a stage/room transition has actually finished settling (see
+    // kStageSettleFrames above).
     if (player != nullptr) {
         const char* stageName = dComIfGp_getStartStageName();
         const int8_t roomNo = fopAcM_GetRoomNo(player);
@@ -400,16 +520,32 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     }
 
     if (g_following) {
+        // The instant the player triggers any stage/room transition (a full
+        // loading zone or a plain intra-stage door/room change - both go
+        // through the same pending "next stage" request), pre-register the
+        // follower into that exact destination before it loads.
+        if (dComIfGp_isEnableNextStage()) {
+            update_follower_stage_registration(
+                dComIfGp_getNextStageName(), dComIfGp_getNextStageRoomNo());
+        }
+
         const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
-        fopAc_ac_c* existing = fopAcM_SearchByID(g_followerId);
+        fopAc_ac_c* existing = g_followerId != 0 ? fopAcM_SearchByID(g_followerId) : nullptr;
         const bool stillAlive = existing != nullptr && fopAcM_GetName(existing) == traits.nameEnum;
 
         if (!stillAlive) {
+            // Clear the stale ID so on_kasi_main_pre can freely adopt the
+            // next matching instance the engine's own stage/room load
+            // creates (the normal, safe path).
+            g_followerId = 0;
+            ++g_missingFrames;
+
+            const bool fallbackDue = g_missingFrames >= kFallbackRespawnDelayFrames;
             const bool safeToRespawn = player != nullptr && g_stageStableFrames >= kStageSettleFrames;
-            if (!safeToRespawn) {
-                // Stage/room is still settling (or the player hasn't
-                // reappeared yet); keep waiting instead of risking a spawn
-                // into a not-yet-ready actor heap.
+            if (!fallbackDue || !safeToRespawn) {
+                // Give the StageService-registered destination room plenty
+                // of time to load and adopt her normally before resorting to
+                // a direct runtime spawn.
             } else if (g_respawnCooldown > 0) {
                 --g_respawnCooldown;
             } else {
@@ -417,6 +553,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
                 g_respawnCooldown = kRespawnCooldownFrames;
             }
         } else {
+            g_missingFrames = 0;
             g_respawnCooldown = 0;
         }
     }
