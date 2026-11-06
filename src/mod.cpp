@@ -96,6 +96,20 @@ static u32 g_followerSpawnParam = 0;
 static StageActorHandle g_stageEditHandle = 0;
 static char g_stageEditStage[8] = {};
 static s16 g_stageEditRoom = -1;
+// Which NPC the current g_stageEditHandle edit was registered for. Needed
+// alongside the stage/room above because a bare (stage, room) match isn't
+// enough to know the existing edit is still correct - the player could
+// transition into the very same destination twice with a different NPC
+// selected each time, which must still trigger re-registration.
+static FollowerChoice g_stageEditChoice = FollowerChoice::Kili;
+
+// (Stage, room) she was standing in the moment she first started following -
+// her natively-authored home spot outside the STAR tent, shared by all three
+// NPCs. Used to avoid pre-registering a duplicate add_actor entry there (the
+// room's own actor-placement data already spawns her) and to decide how to
+// hand her back cleanly when the player switches which NPC is following.
+static char g_followerHomeStage[8] = {};
+static s16 g_followerHomeRoom = -1;
 
 // How long (in ticks) the follower has been missing with no live instance
 // adopted yet. The normal path (StageService pre-registration + main()
@@ -442,6 +456,15 @@ static HookAction on_kasi_escape_pre(FollowerChoice choice, void* args) {
         g_followerSpawnParam = fopAcM_GetParam(self);
         g_missingFrames = 0;
         g_respawnCooldown = 0;
+
+        // This is necessarily her native home spot outside the STAR tent -
+        // the post-STAR-game conversation that leads here only ever happens
+        // there. Remembered so later stage registrations can recognize this
+        // exact (stage, room) as "she already spawns here natively" and skip
+        // adding a duplicate.
+        std::strncpy(g_followerHomeStage, dComIfGp_getStartStageName(), sizeof(g_followerHomeStage) - 1);
+        g_followerHomeRoom = fopAcM_GetRoomNo(self);
+
         mods::log::info("{} is now following the player", follower_choice_name(choice));
     }
 
@@ -496,9 +519,29 @@ static void update_follower_stage_registration(const char* stage, s16 room) {
     if (stage == nullptr || stage[0] == '\0' || room < 0) {
         return;
     }
-    if (g_stageEditHandle != 0 && room == g_stageEditRoom &&
+
+    const bool isHomeDestination = g_followerHomeRoom >= 0 && room == g_followerHomeRoom &&
+        std::strncmp(stage, g_followerHomeStage, sizeof(g_followerHomeStage)) == 0;
+    if (isHomeDestination) {
+        // She's natively authored in this exact room (it's her and the
+        // other two NPCs' shared home spot outside the STAR tent) - the
+        // room's own actor-placement data already spawns her there, so
+        // adding another copy here would duplicate her. Retract any
+        // previous registration (e.g. she's returning home after following
+        // elsewhere) and let the room's native spawn be adopted instead, by
+        // on_kasi_main_pre, exactly like any other destination.
+        if (g_stageEditHandle != 0) {
+            svc_stage->remove_actor_edit(mod_ctx, g_stageEditHandle);
+            g_stageEditHandle = 0;
+            g_stageEditStage[0] = '\0';
+            g_stageEditRoom = -1;
+        }
+        return;
+    }
+
+    if (g_stageEditHandle != 0 && room == g_stageEditRoom && g_stageEditChoice == g_selectedFollower &&
         std::strncmp(stage, g_stageEditStage, sizeof(g_stageEditStage)) == 0) {
-        return;  // Already registered for this exact destination.
+        return;  // Already registered for this exact destination and NPC.
     }
 
     if (g_stageEditHandle != 0) {
@@ -523,6 +566,7 @@ static void update_follower_stage_registration(const char* stage, s16 room) {
         g_stageEditHandle = handle;
         std::strncpy(g_stageEditStage, stage, sizeof(g_stageEditStage) - 1);
         g_stageEditRoom = room;
+        g_stageEditChoice = g_selectedFollower;
     } else {
         mods::log::error(
             "failed to pre-register {} into stage {} room {}", follower_choice_name(g_selectedFollower), stage,
@@ -562,9 +606,65 @@ static void respawn_follower_at_player() {
     }
 }
 
+// Cleanly hands the previously-selected follower NPC back to the game when
+// the player picks a different one, instead of leaving her instance
+// orphaned wherever she physically happened to be - running unmanaged
+// native AI - when main()'s choice check (g_selectedFollower != choice)
+// starts failing for her on the very next tick.
+//
+// If she's currently standing in her native home room (the common case:
+// following hasn't taken her anywhere yet, or she's just returned there),
+// reset() is safe and ideal - it snaps her back to her authored position
+// and idle state in place, since home.pos is only meaningful within her
+// home room's own coordinate space. Otherwise she doesn't belong in
+// whatever (foreign) room she's currently in at all - that instance only
+// exists because she was following - so it's deleted outright; her
+// authored instance will spawn fresh, as normal, next time her home room is
+// loaded.
+static void release_old_follower(ActorId actorId) {
+    if (actorId == 0) {
+        return;
+    }
+    fopAc_ac_c* actor = fopAcM_SearchByID(actorId);
+    if (actor == nullptr) {
+        return;
+    }
+
+    const bool isHome = g_followerHomeRoom >= 0 && fopAcM_GetRoomNo(actor) == g_followerHomeRoom &&
+        std::strncmp(dComIfGp_getStartStageName(), g_followerHomeStage, sizeof(g_followerHomeStage)) == 0;
+
+    if (isHome) {
+        const s16 name = fopAcM_GetName(actor);
+        if (name == fpcNm_NPC_KASIKYU_e) {
+            static_cast<daNpcKasiKyu_c*>(actor)->reset();
+        } else if (name == fpcNm_NPC_KASIHANA_e) {
+            static_cast<daNpcKasiHana_c*>(actor)->reset();
+        } else if (name == fpcNm_NPC_KASIMICH_e) {
+            static_cast<daNpcKasiMich_c*>(actor)->reset();
+        }
+    } else {
+        svc_actor->delete_actor(mod_ctx, actorId);
+    }
+}
+
 static void on_follower_choice_changed(
     ModContext*, ConfigVarHandle, const ConfigVarValue* value, const ConfigVarValue*, void*) {
-    g_selectedFollower = parse_follower_choice(value->int_value);
+    const FollowerChoice newChoice = parse_follower_choice(value->int_value);
+    if (g_following && newChoice != g_selectedFollower) {
+        release_old_follower(g_followerId);
+        // Safe to clear unconditionally: on_kasi_main_pre's g_followerId==0
+        // adoption check is independent of this missing-frames/fallback
+        // bookkeeping, so if the newly chosen NPC is already loaded nearby
+        // she's adopted instantly on her very next main() tick; otherwise
+        // the normal StageService pre-registration/fallback path takes over
+        // exactly as it would for any other "missing follower" case.
+        g_followerId = 0;
+        g_missingFrames = 0;
+        g_respawnCooldown = 0;
+        g_followerMoving = false;
+        g_lostOffscreenFrames = 0;
+    }
+    g_selectedFollower = newChoice;
     mods::log::info("Follower choice set to {}", follower_choice_name(g_selectedFollower));
 }
 
