@@ -7,9 +7,11 @@
 #include "mods/svc/ui.h"
 
 // Game includes
+#include "d/actor/d_a_npc.h"
 #include "d/actor/d_a_npc_kasi_hana.h"
 #include "d/actor/d_a_npc_kasi_kyu.h"
 #include "d/actor/d_a_npc_kasi_mich.h"
+#include "d/d_camera.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
 #include "d/d_stage.h"
@@ -167,6 +169,26 @@ constexpr f32 kMaxStepUpPerTick = 80.0f;
 // idling at kIdleDistance. See the hysteresis comment on kFollowDistance.
 static bool g_followerMoving = false;
 
+// Last-resort rescue for when she gets properly stuck/left behind (e.g.
+// blocked by geometry her pathing can't get around) rather than just
+// trailing a normal following distance behind: if she's more than
+// kLostDistance (full 3D, not just XZ, so being stuck below/above the
+// player on a different level also counts) from the player AND not visible
+// on screen, continuously, for kLostDelayFrames, teleport her to just
+// behind the camera - hidden from the player's view - so she reappears
+// near them instead of staying stranded.
+constexpr f32 kLostDistance = 2000.0f;
+constexpr int kLostDelayFrames = 180;  // ~3s at 60fps.
+constexpr f32 kTeleportBehindCameraDist = 200.0f;
+
+// Rough humanoid-sized probe box (local to her own position/orientation),
+// used with daNpcT_chkActorInScreen to test whether any part of her would
+// currently be visible on screen.
+constexpr f32 kScreenCheckHalfWidth = 30.0f;
+constexpr f32 kScreenCheckHeight = 180.0f;
+
+static int g_lostOffscreenFrames = 0;
+
 // dSv_event_flag_c::F_290 - Castle Town - Star Game 1 cleared
 constexpr u32 kStarGameClearedFlag = 290;
 
@@ -223,12 +245,70 @@ static const char* follower_choice_name(FollowerChoice choice) {
     }
 }
 
+// If she's drifted far from the player (full 3D distance, so being stuck
+// above/below them on a different level counts too) and isn't currently
+// visible on screen, continuously, for long enough, she's probably stuck
+// behind geometry her pathing couldn't resolve on its own. Teleport her to
+// just behind the camera - still hidden from view - so she reappears near
+// the player instead of staying stranded. Returns true if she was just
+// teleported this tick.
 template <class T>
-static void follow_tick_impl(T* self, const FollowMotionSet& motions) {
+static bool try_rescue_lost_follower(
+    T* self, fopAc_ac_c* player, FollowerChoice choice) {
+    const f32 dist3d = fopAcM_searchActorDistance(self, player);
+    const bool isLost = dist3d > kLostDistance;
+    const bool isOnScreen = daNpcT_chkActorInScreen(
+        self, -kScreenCheckHalfWidth, 0.0f, -kScreenCheckHalfWidth, kScreenCheckHalfWidth,
+        kScreenCheckHeight, kScreenCheckHalfWidth, 0.0f, 0);
+
+    if (!isLost || isOnScreen) {
+        g_lostOffscreenFrames = 0;
+        return false;
+    }
+
+    if (++g_lostOffscreenFrames < kLostDelayFrames) {
+        return false;
+    }
+    g_lostOffscreenFrames = 0;
+
+    dCamera_c* camera = dCam_getBody();
+    if (camera == nullptr) {
+        return false;
+    }
+
+    // "Behind the camera" = further along the eye-to-center direction, past
+    // the eye rather than toward the subject. Flattened to the XZ plane so
+    // she lands beside the camera's position rather than floating at its
+    // (possibly elevated) pitch - the ground-snap probe in follow_tick_impl
+    // corrects her height from there on the very next tick.
+    cXyz eye = camera->Eye();
+    cXyz backDir = eye - camera->Center();
+    backDir.y = 0.0f;
+    const f32 backDirLen = backDir.absXZ();
+    if (backDirLen > 1.0f) {
+        backDir.x /= backDirLen;
+        backDir.z /= backDirLen;
+    } else {
+        backDir.set(0.0f, 0.0f, 1.0f);
+    }
+
+    cXyz teleportPos = eye + backDir * kTeleportBehindCameraDist;
+    teleportPos.y = self->current.pos.y;
+
+    self->current.pos = teleportPos;
+    self->old.pos = teleportPos;
+    mods::log::info("{} was lost and teleported back near the player", follower_choice_name(choice));
+    return true;
+}
+
+template <class T>
+static void follow_tick_impl(T* self, const FollowMotionSet& motions, FollowerChoice choice) {
     fopAc_ac_c* player = dComIfGp_getPlayer(0);
     if (player == nullptr) {
         return;
     }
+
+    try_rescue_lost_follower(self, player, choice);
 
     self->_turn_pos(player->current.pos, kTurnRate);
 
@@ -337,7 +417,7 @@ static HookAction on_kasi_main_pre(
         return HOOK_CONTINUE;
     }
 
-    follow_tick_impl(self, motions);
+    follow_tick_impl(self, motions, choice);
     if (retval != nullptr) {
         *static_cast<BOOL*>(retval) = TRUE;
     }
