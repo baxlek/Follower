@@ -82,6 +82,12 @@ static bool g_following = false;
 static ActorId g_followerId = 0;
 static ConfigVarHandle g_followerChoiceVar = 0;
 
+// Whether mod_update has yet checked whether the STAR game was already
+// cleared the very first time it ran (see start_following_immediately).
+// Set once and never reset - only relevant for the very first tick a player
+// actor exists after the mod loads.
+static bool g_checkedInitialStarGameState = false;
+
 // Her creation `parameters`, captured from the live actor the moment she
 // starts following and reused for every future StageService::add_actor
 // registration, so a freshly (re)created instance keeps the same identity/
@@ -464,6 +470,46 @@ static HookAction on_kasi_main_pre(
     return HOOK_SKIP_ORIGINAL;
 }
 
+// Starts following right away, independent of any NPC's own escape() ever
+// firing - needed for save files where the STAR game was already cleared
+// (and the group's one-time native "thanks, we're off" conversation already
+// played out) before this mod was ever installed/running, since that
+// native, once-per-save cutscene can't be replayed to drive
+// on_kasi_escape_pre. Only ever called once, from mod_update's first-tick
+// check below, so it never short-circuits the normal conversation-triggered
+// path for a player who hasn't cleared the game yet.
+static void start_following_immediately() {
+    const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
+
+    fopAc_ac_c* existing = fopAcM_SearchByName(traits.nameEnum);
+    if (existing != nullptr) {
+        // She happens to already be loaded (e.g. the player is currently
+        // near her home room) - remember her real spawn parameters/home
+        // location, exactly as on_kasi_escape_pre would have. Leave
+        // g_followerId at 0 so on_kasi_main_pre adopts this exact instance
+        // and snaps her to the player on its very next tick, same as any
+        // other adoption.
+        g_followerSpawnParam = fopAcM_GetParam(existing);
+        std::strncpy(g_followerHomeStage, dComIfGp_getStartStageName(), sizeof(g_followerHomeStage) - 1);
+        g_followerHomeRoom = fopAcM_GetRoomNo(existing);
+    } else {
+        // Not currently loaded anywhere nearby - fall back to default spawn
+        // parameters. mod_update's normal missing-follower handling (short
+        // delay, no stage transition pending) takes over immediately,
+        // respawning her hidden just behind the camera like any other
+        // recovery.
+        g_followerSpawnParam = 0;
+    }
+
+    g_following = true;
+    g_followerId = 0;
+    g_missingFrames = 0;
+    g_respawnCooldown = 0;
+    g_followerMoving = false;
+    g_lostOffscreenFrames = 0;
+    mods::log::info("{} is now following the player", follower_choice_name(g_selectedFollower));
+}
+
 // Fires the first (and only) time this NPC is signaled to run away after the
 // post-STAR-game conversation. If she's the currently-selected follower
 // choice, we latch "following" mode and cancel the flee entirely; otherwise
@@ -823,6 +869,23 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         }
     } else {
         g_stageStableFrames = 0;
+    }
+
+    // One-time check, the very first tick a player actor exists: if the
+    // STAR game was already cleared before the mod ever started observing
+    // this save (e.g. installed mid-playthrough on an existing save), the
+    // group's native one-time "thanks, we're off" conversation has already
+    // irrevocably played out and can never fire on_kasi_escape_pre again -
+    // so start following right away instead of waiting on a conversation
+    // that will never happen. If the flag isn't set yet here, the player is
+    // still progressing normally, so this is skipped entirely and the usual
+    // conversation-triggered path (on_kasi_escape_pre) remains the only way
+    // following starts, preserving that narrative beat for them.
+    if (!g_checkedInitialStarGameState && player != nullptr) {
+        g_checkedInitialStarGameState = true;
+        if (!g_following && daNpcF_chkEvtBit(kStarGameClearedFlag)) {
+            start_following_immediately();
+        }
     }
 
     if (g_following) {
