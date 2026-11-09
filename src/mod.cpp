@@ -120,6 +120,17 @@ static s16 g_followerHomeRoom = -1;
 static int g_missingFrames = 0;
 constexpr int kFallbackRespawnDelayFrames = 150;  // ~2.5s at 60fps.
 
+// Much shorter fallback delay used when she goes missing with no stage/room
+// transition in flight at all (dComIfGp_isEnableNextStage() false) - i.e.
+// she wasn't caught mid-load, she was silently culled by the engine's own
+// room-visibility system for lagging too far behind the player in open,
+// multi-room areas with no loading zone to catch (see mod_update). There's
+// no destination-room load to wait out here, so there's no reason to sit on
+// the long delay above - every extra frame is a frame the lost-follower
+// teleport rescue in follow_tick_impl can't run either, since that rescue
+// needs a still-living instance to move.
+constexpr int kCulledRespawnDelayFrames = 10;  // ~0.17s at 60fps.
+
 // Frames to wait between fallback respawn attempts once the follower is
 // missing, so a persistently failing spawn (e.g. missing resources) doesn't
 // spam the actor service every tick.
@@ -259,6 +270,39 @@ static const char* follower_choice_name(FollowerChoice choice) {
     }
 }
 
+// Computes a position just behind the camera - hidden from the player's
+// view - used both to teleport an already-live, stuck follower back near
+// the player (see try_rescue_lost_follower) and to place her when a runtime
+// respawn is needed (see respawn_follower_near_player), so she never
+// visibly "pops in" right in front of them either way. Falls back to the
+// player's own position if the camera isn't available.
+static cXyz compute_hidden_teleport_pos(fopAc_ac_c* player, f32 fallbackY) {
+    dCamera_c* camera = dCam_getBody();
+    if (camera == nullptr) {
+        return player->current.pos;
+    }
+
+    // "Behind the camera" = further along the eye-to-center direction, past
+    // the eye rather than toward the subject. Flattened to the XZ plane so
+    // she lands beside the camera's position rather than floating at its
+    // (possibly elevated) pitch - the ground-snap probe in follow_tick_impl
+    // corrects her height from there on her very next tick, once alive.
+    cXyz eye = camera->Eye();
+    cXyz backDir = eye - camera->Center();
+    backDir.y = 0.0f;
+    const f32 backDirLen = backDir.absXZ();
+    if (backDirLen > 1.0f) {
+        backDir.x /= backDirLen;
+        backDir.z /= backDirLen;
+    } else {
+        backDir.set(0.0f, 0.0f, 1.0f);
+    }
+
+    cXyz pos = eye + backDir * kTeleportBehindCameraDist;
+    pos.y = fallbackY;
+    return pos;
+}
+
 // If she's drifted far from the player (full 3D distance, so being stuck
 // above/below them on a different level counts too) and isn't currently
 // visible on screen, continuously, for long enough, she's probably stuck
@@ -290,25 +334,7 @@ static bool try_rescue_lost_follower(
         return false;
     }
 
-    // "Behind the camera" = further along the eye-to-center direction, past
-    // the eye rather than toward the subject. Flattened to the XZ plane so
-    // she lands beside the camera's position rather than floating at its
-    // (possibly elevated) pitch - the ground-snap probe in follow_tick_impl
-    // corrects her height from there on the very next tick.
-    cXyz eye = camera->Eye();
-    cXyz backDir = eye - camera->Center();
-    backDir.y = 0.0f;
-    const f32 backDirLen = backDir.absXZ();
-    if (backDirLen > 1.0f) {
-        backDir.x /= backDirLen;
-        backDir.z /= backDirLen;
-    } else {
-        backDir.set(0.0f, 0.0f, 1.0f);
-    }
-
-    cXyz teleportPos = eye + backDir * kTeleportBehindCameraDist;
-    teleportPos.y = self->current.pos.y;
-
+    const cXyz teleportPos = compute_hidden_teleport_pos(player, self->current.pos.y);
     self->current.pos = teleportPos;
     self->old.pos = teleportPos;
     mods::log::info("{} was lost and teleported back near the player", follower_choice_name(choice));
@@ -574,25 +600,37 @@ static void update_follower_stage_registration(const char* stage, s16 room) {
     }
 }
 
-// Last-resort fallback: respawns the selected follower NPC at the player's
-// current position/room via a direct runtime actor creation call. Only used
-// when she's been missing for a long time with no StageService-registered
-// instance having been adopted (e.g. a teleport that never set
-// isEnableNextStage()), since this path is what previously corrupted engine
-// state badly enough to unload other NPCs/the player and crash.
-static void respawn_follower_at_player() {
+// Fallback: respawns the selected follower NPC near the player (hidden just
+// behind the camera, same as the live lost-follower rescue, so she doesn't
+// visibly pop in right in front of them) via a direct runtime actor creation
+// call. Used both as a true last resort when she's been missing for a long
+// time with no StageService-registered instance adopted (e.g. a teleport
+// that never set isEnableNextStage() - the long delay in that case gives
+// the normal/safe path plenty of time to resolve itself first), and as a
+// much quicker recovery when she's missing with no stage/room transition in
+// flight at all - the engine's own room-visibility system silently culling
+// her for lagging too far behind in an open, multi-room area, which the
+// live, on-instance teleport rescue in follow_tick_impl can never catch on
+// its own (it needs a still-living instance to move). Direct runtime
+// creation is what previously corrupted engine state badly enough to unload
+// other NPCs/the player and crash when used during an unsettled stage load,
+// so mod_update() only ever calls this once the player's (stage, room) has
+// been stable for kStageSettleFrames, regardless of which of the two cases
+// above triggered it.
+static void respawn_follower_near_player() {
     fopAc_ac_c* player = dComIfGp_getPlayer(0);
     if (player == nullptr) {
         return;
     }
 
     const FollowerNpcTraits& traits = kFollowerTraits[static_cast<int>(g_selectedFollower)];
+    const cXyz spawnPos = compute_hidden_teleport_pos(player, player->current.pos.y);
 
     ActorSpawnParams params = {
         .parameters = g_followerSpawnParam,
         .argument = 0,
         .room_num = fopAcM_GetRoomNo(player),
-        .position = {player->current.pos.x, player->current.pos.y, player->current.pos.z},
+        .position = {spawnPos.x, spawnPos.y, spawnPos.z},
         .angle = {player->current.angle.x, player->current.angle.y, player->current.angle.z},
         .scale = {1.0f, 1.0f, 1.0f},
     };
@@ -792,7 +830,8 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         // loading zone or a plain intra-stage door/room change - both go
         // through the same pending "next stage" request), pre-register the
         // follower into that exact destination before it loads.
-        if (dComIfGp_isEnableNextStage()) {
+        const bool pendingTransition = dComIfGp_isEnableNextStage();
+        if (pendingTransition) {
             update_follower_stage_registration(
                 dComIfGp_getNextStageName(), dComIfGp_getNextStageRoomNo());
         }
@@ -808,16 +847,25 @@ MOD_EXPORT ModResult mod_update(ModError*) {
             g_followerId = 0;
             ++g_missingFrames;
 
-            const bool fallbackDue = g_missingFrames >= kFallbackRespawnDelayFrames;
+            // With an actual stage/room transition in flight, give the
+            // StageService-registered destination room plenty of time to
+            // load and adopt her normally before resorting to a direct
+            // runtime spawn. Outside of a transition, she can only have
+            // disappeared because the engine's own room-visibility system
+            // culled her for lagging too far behind (there's no destination
+            // load to wait out), so recover much sooner - every extra frame
+            // here is a frame the live teleport rescue in follow_tick_impl
+            // can't help either, since it needs a still-living instance.
+            const int respawnDelay = pendingTransition ? kFallbackRespawnDelayFrames : kCulledRespawnDelayFrames;
+            const bool fallbackDue = g_missingFrames >= respawnDelay;
             const bool safeToRespawn = player != nullptr && g_stageStableFrames >= kStageSettleFrames;
             if (!fallbackDue || !safeToRespawn) {
-                // Give the StageService-registered destination room plenty
-                // of time to load and adopt her normally before resorting to
-                // a direct runtime spawn.
+                // Not yet due, or the stage/room hasn't settled long enough
+                // for a direct runtime spawn to be safe - keep waiting.
             } else if (g_respawnCooldown > 0) {
                 --g_respawnCooldown;
             } else {
-                respawn_follower_at_player();
+                respawn_follower_near_player();
                 g_respawnCooldown = kRespawnCooldownFrames;
             }
         } else {
